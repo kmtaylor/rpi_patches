@@ -1,0 +1,225 @@
+diff -ur jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/common/jack/systemdeps.h jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/common/jack/systemdeps.h
+--- jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/common/jack/systemdeps.h	2012-05-29 19:11:00.000000000 +0000
++++ jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/common/jack/systemdeps.h	2014-07-16 00:27:07.393066708 +0000
+@@ -120,4 +120,9 @@
+ 
+     #endif /* __APPLE__ || __linux__ || __sun__ || sun */
+ 
++#ifdef __ARMEL__
++	#undef POST_PACKED_STRUCTURE
++	#define POST_PACKED_STRUCTURE
++#endif
++
+ #endif
+diff -ur jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/debian/rules jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/debian/rules
+--- jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/debian/rules	2012-11-27 20:22:31.000000000 +0000
++++ jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/debian/rules	2014-07-15 23:44:29.514352549 +0000
+@@ -41,7 +41,7 @@
+ 
+ waf-configure-options = --prefix=/usr --classic
+ waf-configure-options += --libdir=/usr/lib/$(DEB_HOST_MULTIARCH)
+-waf-configure-options += $(if $(filter linux,$(DEB_HOST_ARCH_OS)),--alsa --dbus)
++waf-configure-options += $(if $(filter linux,$(DEB_HOST_ARCH_OS)),--alsa)
+ waf-configure-options += $(if $(filter amd64 i386 powerpc,$(DEB_HOST_ARCH)),--firewire)
+ 
+ DEB_MAKE_INVOKE = ./waf -v --destdir=$(CURDIR)/debian/tmp
+@@ -86,7 +86,6 @@
+ 	dh_install -pjackd2 debian/tmp/usr/lib/$(DEB_HOST_MULTIARCH)/jack/jack_alsa.so
+ 	dh_install -pjackd2 debian/tmp/usr/lib/$(DEB_HOST_MULTIARCH)/jack/jack_alsarawmidi.so
+ 	dh_install -pjackd2 debian/tmp/usr/lib/$(DEB_HOST_MULTIARCH)/jack/audioadapter.so
+-	dh_install -pjackd2 debian/tmp/usr/share/dbus-1/*
+ endif	
+ 
+ binary-install/jackd2::
+diff -ur jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/alsa_driver.c jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/alsa_driver.c
+--- jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/alsa_driver.c	2012-05-29 19:11:00.000000000 +0000
++++ jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/alsa_driver.c	2014-07-23 11:35:48.970000000 +0000
+@@ -991,8 +991,9 @@
+ 		}
+ 	}
+ 
+-	if ((driver->capture_handle && driver->capture_and_playback_not_synced)
+-	    || !driver->playback_handle) {
++	if (driver->capture_handle && (
++			driver->capture_and_playback_not_synced || 
++			!driver->playback_handle)) {
+ 		if ((err = snd_pcm_prepare (driver->capture_handle)) < 0) {
+ 			jack_error ("ALSA: prepare error for capture on \"%s\""
+ 				    " (%s)", driver->alsa_name_capture,
+@@ -1085,8 +1086,9 @@
+ 		}
+ 	}
+ 
+-	if ((driver->capture_handle && driver->capture_and_playback_not_synced)
+-	    || !driver->playback_handle) {
++	if (driver->capture_handle && (
++			driver->capture_and_playback_not_synced ||
++			!driver->playback_handle)) {
+ 		if ((err = snd_pcm_start (driver->capture_handle)) < 0) {
+ 			jack_error ("ALSA: could not start capture (%s)",
+ 				    snd_strerror (err));
+@@ -1610,10 +1612,6 @@
+ 		return 0;
+ 	}
+ */
+-	if (!driver->playback_handle) {
+-		return 0;
+-	}
+-
+ 	if (nframes > driver->frames_per_cycle) {
+ 		return -1;
+ 	}
+@@ -1621,6 +1619,10 @@
+ 	if (driver->midi)
+ 		(driver->midi->write)(driver->midi, nframes);
+ 
++	if (!driver->playback_handle) {
++		return 0;
++	}
++
+ 	nwritten = 0;
+ 	contiguous = 0;
+ 	orig_nframes = nframes;
+diff -ur jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/alsa_seqmidi.c jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/alsa_seqmidi.c
+--- jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/alsa_seqmidi.c	2012-05-29 19:11:00.000000000 +0000
++++ jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/alsa_seqmidi.c	2014-07-17 01:56:57.363334526 +0000
+@@ -145,13 +145,13 @@
+ 	{
+ 		SND_SEQ_PORT_CAP_SUBS_READ,
+ 		JackPortIsOutput,
+-		"playback",
++		"capture",
+ 		do_jack_input
+ 	},
+ 	{
+ 		SND_SEQ_PORT_CAP_SUBS_WRITE,
+ 		JackPortIsInput,
+-		"capture",
++		"playback",
+ 		do_jack_output
+ 	}
+ };
+@@ -497,12 +497,10 @@
+ 		snprintf(name, sizeof(name), "system:midi_playback_%d", ++self->midi_out_cnt);
+ 
+ 	port->jack_port = jack_port_register(self->jack,
+-		name, JACK_DEFAULT_MIDI_TYPE, jack_caps, 0);
++		port->name, JACK_DEFAULT_MIDI_TYPE, jack_caps, 0);
+ 	if (!port->jack_port)
+ 		goto failed;
+ 
+-	jack_port_set_alias (port->jack_port, port->name);
+-
+ 	/* generate an alias */
+ 
+ 	snprintf(port->name, sizeof(port->name), "%s:midi/%s_%d",
+@@ -514,6 +512,7 @@
+ 			*c = '-';
+ 
+ 	jack_port_set_alias (port->jack_port, port->name);
++	jack_port_set_alias (port->jack_port, name);
+ 
+ 	if (type == PORT_INPUT)
+ 		err = alsa_connect_from(self, port->remote.client, port->remote.port);
+diff -ur jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/JackAlsaDriver.cpp jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/JackAlsaDriver.cpp
+--- jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/JackAlsaDriver.cpp	2012-05-29 19:11:00.000000000 +0000
++++ jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/JackAlsaDriver.cpp	2014-07-29 01:44:28.660000000 +0000
+@@ -350,7 +350,7 @@
+ 
+ int JackAlsaDriver::Start()
+ {
+-    int res = JackAudioDriver::Start();
++    int res = JackTimedDriver::Start();
+     if (res >= 0) {
+         res = alsa_driver_start((alsa_driver_t *)fDriver);
+         if (res < 0) {
+@@ -375,6 +375,13 @@
+     int wait_status;
+     jack_nframes_t nframes;
+     fDelayedUsecs = 0.f;
++    alsa_driver_t *driver = (alsa_driver_t *) fDriver;
++
++    if (!(driver->capture_handle || driver->playback_handle)) { 
++	ProcessWait();
++	JackDriver::CycleTakeBeginTime();
++	goto read;
++    }
+ 
+ retry:
+ 
+@@ -398,6 +405,7 @@
+     // Has to be done before read
+     JackDriver::CycleIncTime();
+ 
++read:
+     return alsa_driver_read((alsa_driver_t *)fDriver, fEngineControl->fBufferSize);
+ }
+ 
+@@ -929,12 +937,6 @@
+         }
+     }
+ 
+-    /* duplex is the default */
+-    if (!capture && !playback) {
+-        capture = TRUE;
+-        playback = TRUE;
+-    }
+-
+     g_alsa_driver = new Jack::JackAlsaDriver("system", "alsa_pcm", engine, table);
+     Jack::JackDriverClientInterface* threaded_driver = new Jack::JackThreadedDriver(g_alsa_driver);
+     // Special open for ALSA driver...
+diff -ur jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/JackAlsaDriver.h jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/JackAlsaDriver.h
+--- jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/JackAlsaDriver.h	2012-05-29 19:11:00.000000000 +0000
++++ jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/JackAlsaDriver.h	2014-07-20 05:26:17.950000000 +0000
+@@ -22,6 +22,7 @@
+ #define __JackAlsaDriver__
+ 
+ #include "JackAudioDriver.h"
++#include "JackTimedDriver.h"
+ #include "JackThreadedDriver.h"
+ #include "JackTime.h"
+ #include "alsa_driver.h"
+@@ -33,7 +34,7 @@
+ \brief The ALSA driver.
+ */
+ 
+-class JackAlsaDriver : public JackAudioDriver
++class JackAlsaDriver : public JackTimedDriver
+ {
+ 
+     private:
+@@ -47,7 +48,7 @@
+     public:
+ 
+         JackAlsaDriver(const char* name, const char* alias, JackLockedEngine* engine, JackSynchro* table)
+-		: JackAudioDriver(name, alias, engine, table),fDriver(NULL),fReservedCaptureDevice(-1),fReservedPlaybackDevice(-1)
++		: JackTimedDriver(name, alias, engine, table),fDriver(NULL),fReservedCaptureDevice(-1),fReservedPlaybackDevice(-1)
+         {}
+         virtual ~JackAlsaDriver()
+         {}
+diff -ur jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/JackLinuxTime.c jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/JackLinuxTime.c
+--- jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/JackLinuxTime.c	2012-05-29 19:11:00.000000000 +0000
++++ jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/JackLinuxTime.c	2014-07-16 01:30:47.627009873 +0000
+@@ -217,7 +217,7 @@
+ 
+ SERVER_EXPORT void InitTime()
+ {
+-	__jack_cpu_mhz = jack_get_mhz ();
++	//__jack_cpu_mhz = jack_get_mhz ();
+ }
+ 
+ SERVER_EXPORT void EndTime()
+diff -ur jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/posix/JackCompilerDeps_os.h jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/posix/JackCompilerDeps_os.h
+--- jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/posix/JackCompilerDeps_os.h	2012-05-29 19:11:00.000000000 +0000
++++ jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/posix/JackCompilerDeps_os.h	2014-07-16 00:28:29.610136977 +0000
+@@ -58,5 +58,10 @@
+     #define POST_PACKED_STRUCTURE
+ #endif
+ 
++#ifdef __ARMEL__
++	#undef POST_PACKED_STRUCTURE
++	#define POST_PACKED_STRUCTURE
++#endif
++
+ #endif
+ 
