@@ -71,7 +71,7 @@ static char *adaptor_names[] = {
 #define SNDRV_SERIAL_NORMALBUFF 0 /* Normal blocking buffer operation */
 #define SNDRV_SERIAL_DROPBUFF   1 /* Non-blocking discard operation */
 
-static int speed = 38400; /* 9600,19200,38400,57600,115200 */
+static int speed = 115200; /* 9600,19200,38400,57600,115200 */
 static int outs = 1;	 /* 1 to 16 */
 static int ins = 1;	/* 1 to 16 */
 static int adaptor = SNDRV_SERIAL_GENERIC;
@@ -182,10 +182,9 @@ static void snd_uart_pl011_io_loop(struct snd_uart_pl011 * uart)
 	substream = uart->prev_in;
 
 	/* Read Loop */
-	while (readw(uart->membase + UART011_MIS) &
-			(UART011_RTIS | UART011_RXIS)) {
+	while (!(readw(uart->membase + UART01x_FR) & UART01x_FR_RXFE)) {
 		/* while receive data ready */
-		c = readw(uart->membase + UART01x_DR);
+		c = readb(uart->membase + UART01x_DR);
 
 		/* keep track of last status byte */
 		if (c & 0x80)
