@@ -115,6 +115,8 @@ struct snd_uart_pl011 {
 	int filemode;		/* open status of file */
 
 	spinlock_t open_lock;
+	wait_queue_head_t drain_wait;
+	int draining;
 
 	int irq;
 
@@ -224,6 +226,7 @@ static void snd_uart_pl011_io_loop(struct snd_uart_pl011 * uart)
 	if (readw(uart->membase + UART011_MIS) & UART011_TXIS) {
 		writew(UART011_TXIC, uart->membase + UART011_ICR);
 		uart->fifo_count = 2;
+		if (unlikely(uart->draining)) wake_up(&uart->drain_wait);
 	}
 
 	if (readw(uart->membase + UART01x_FR) & UART011_FR_TXFE)
@@ -301,10 +304,7 @@ static void snd_uart_pl011_do_open(struct snd_uart_pl011 * uart)
 	     , uart->membase + UART011_CR);
 
 	uart->clk_rate = clk_get_rate(uart->clk);
-	if (uart->speed > uart->clk_rate/16)
-		quot = DIV_ROUND_CLOSEST(uart->clk_rate * 8, uart->speed);
-	else
-		quot = DIV_ROUND_CLOSEST(uart->clk_rate * 4, uart->speed);
+	quot = DIV_ROUND_CLOSEST(uart->clk_rate * 4, uart->speed);
 
 	writew(quot & 0x3f, uart->membase + UART011_FBRD);
 	writew(quot >> 6, uart->membase + UART011_IBRD);
@@ -504,7 +504,6 @@ static int snd_uart_pl011_output_byte(struct snd_uart_pl011 *uart,
 
 static void snd_uart_pl011_output_write(struct snd_rawmidi_substream *substream)
 {
-	unsigned long flags;
 	unsigned char midi_byte, addr_byte;
 	struct snd_uart_pl011 *uart = substream->rmidi->private_data;
 	char first;
@@ -514,8 +513,6 @@ static void snd_uart_pl011_output_write(struct snd_rawmidi_substream *substream)
 	 * since it is 'bad' to have two processes updating the same
 	 * variables (ie buff_in & buff_out)
 	 */
-
-	spin_lock_irqsave(&uart->open_lock, flags);
 
 	if (uart->adaptor == SNDRV_SERIAL_MS124W_MB) {
 		while (1) {
@@ -587,7 +584,6 @@ static void snd_uart_pl011_output_write(struct snd_rawmidi_substream *substream)
 		}
 		lasttime = jiffies;
 	}
-	spin_unlock_irqrestore(&uart->open_lock, flags);
 }
 
 static void snd_uart_pl011_output_trigger(struct snd_rawmidi_substream *substream,
@@ -597,13 +593,42 @@ static void snd_uart_pl011_output_trigger(struct snd_rawmidi_substream *substrea
 	struct snd_uart_pl011 *uart = substream->rmidi->private_data;
 
 	spin_lock_irqsave(&uart->open_lock, flags);
-	if (up)
+	if (up) {
 		uart->filemode |= SERIAL_MODE_OUTPUT_TRIGGERED;
-	else
+		snd_uart_pl011_output_write(substream);
+	} else
 		uart->filemode &= ~SERIAL_MODE_OUTPUT_TRIGGERED;
 	spin_unlock_irqrestore(&uart->open_lock, flags);
-	if (up)
-		snd_uart_pl011_output_write(substream);
+}
+
+static void snd_uart_pl011_output_drain(struct snd_rawmidi_substream *substream)
+{
+	unsigned long flags;
+	struct snd_uart_pl011 *uart = substream->rmidi->private_data;
+	DEFINE_WAIT(wait);
+	long timeout;
+
+	spin_lock_irqsave(&uart->open_lock, flags);
+
+	if (uart->filemode == SERIAL_MODE_NOT_OPENED) {
+		spin_unlock_irqrestore(&uart->open_lock, flags);
+		return;
+	}
+
+	if (uart->buff_in_count || uart->fifo_count) {
+		uart->draining++;
+		do {
+			timeout = msecs_to_jiffies(50);
+			prepare_to_wait(&uart->drain_wait, &wait,
+					TASK_UNINTERRUPTIBLE);
+			spin_unlock_irqrestore(&uart->open_lock, flags);
+			timeout = schedule_timeout(timeout);
+			spin_lock_irqsave(&uart->open_lock, flags);
+		} while ((uart->buff_in_count || uart->fifo_count) && timeout);
+		uart->draining = 0;
+		finish_wait(&uart->drain_wait, &wait);
+	}
+	spin_unlock_irqrestore(&uart->open_lock, flags);
 }
 
 static struct snd_rawmidi_ops snd_uart_pl011_output =
@@ -611,6 +636,7 @@ static struct snd_rawmidi_ops snd_uart_pl011_output =
 	.open =		snd_uart_pl011_output_open,
 	.close =	snd_uart_pl011_output_close,
 	.trigger =	snd_uart_pl011_output_trigger,
+	.drain =	snd_uart_pl011_output_drain,
 };
 
 static struct snd_rawmidi_ops snd_uart_pl011_input =
@@ -708,6 +734,8 @@ static int snd_uart_pl011_create(struct snd_card *card,
 		return -ENODEV;
 	}
 	uart->irq = devptr->irq[0];
+
+	init_waitqueue_head(&uart->drain_wait);
 
 	snd_printk(KERN_INFO "Detected PL011 at 0x%lx using irq: %i\n",
 			uart->mapbase, uart->irq);
