@@ -70,12 +70,17 @@ static char *adaptor_names[] = {
 
 #define SNDRV_SERIAL_NORMALBUFF 0 /* Normal blocking buffer operation */
 #define SNDRV_SERIAL_DROPBUFF   1 /* Non-blocking discard operation */
+#define SNDRV_SERIAL_NOTHROTTLE 0
+#define SNDRV_SERIAL_DEFAULT_FIFO 16
 
 static int speed = 115200; /* 9600,19200,38400,57600,115200 */
 static int outs = 1;	 /* 1 to 16 */
 static int ins = 1;	/* 1 to 16 */
 static int adaptor = SNDRV_SERIAL_GENERIC;
 static bool droponfull = SNDRV_SERIAL_NORMALBUFF;
+static bool throttle_tx = SNDRV_SERIAL_NOTHROTTLE;
+static int throttle_delay = 1;
+static int fifo_limit = SNDRV_SERIAL_DEFAULT_FIFO;
 
 module_param(speed, int, 0444);
 MODULE_PARM_DESC(speed, "Speed in bauds.");
@@ -85,6 +90,12 @@ module_param(ins, int, 0444);
 MODULE_PARM_DESC(ins, "Number of MIDI inputs.");
 module_param(droponfull, bool, 0444);
 MODULE_PARM_DESC(droponfull, "Flag to enable drop-on-full buffer mode");
+module_param(throttle_tx, bool, 0444);
+MODULE_PARM_DESC(throttle_tx, "Do not continuously fill TX FIFO");
+module_param(throttle_delay, int, 0444);
+MODULE_PARM_DESC(throttle_delay, "Time in jiffies between each TX write");
+module_param(fifo_limit, int, 0444);
+MODULE_PARM_DESC(fifo_limit, "Maximum TX bytes per write");
 
 module_param(adaptor, int, 0444);
 MODULE_PARM_DESC(adaptor, "Type of adaptor.");
@@ -129,8 +140,8 @@ struct snd_uart_pl011 {
 	unsigned int speed;
 
 	/* parameter for using of write loop */
-	short int fifo_limit;	/* used in uart16550 */
-        short int fifo_count;	/* used in uart16550 */
+	short int fifo_limit;
+        short int fifo_count;
 
 	/* type of adaptor */
 	int adaptor;
@@ -149,7 +160,30 @@ struct snd_uart_pl011 {
         int buff_in;
         int buff_out;
         int drop_on_full;
+	int throttle_tx;
+	int throttle_delay;
+
+	int timer_running;
+	struct timer_list buffer_timer;
 };
+
+static inline void snd_uart_pl011_add_timer(struct snd_uart_pl011 *uart)
+{
+        if (!uart->timer_running) {
+                /* Smallest possible delay */
+                uart->buffer_timer.expires = jiffies + uart->throttle_delay;
+                uart->timer_running = 1;
+                add_timer(&uart->buffer_timer);
+        }
+}
+
+static inline void snd_uart_pl011_del_timer(struct snd_uart_pl011 *uart)
+{
+        if (uart->timer_running) {
+                del_timer(&uart->buffer_timer);
+                uart->timer_running = 0;
+        }
+}
 
 /* This macro is only used in snd_uart_pl011_io_loop */
 static inline void snd_uart_pl011_buffer_output(struct snd_uart_pl011 *uart)
@@ -182,7 +216,7 @@ static void snd_uart_pl011_io_loop(struct snd_uart_pl011 * uart)
 
 	/* recall previous stream */
 	substream = uart->prev_in;
-
+    
 	/* Read Loop */
 	while (!(readw(uart->membase + UART01x_FR) & UART01x_FR_RXFE)) {
 		/* while receive data ready */
@@ -220,6 +254,8 @@ static void snd_uart_pl011_io_loop(struct snd_uart_pl011 * uart)
 	/* remember the last stream */
 	uart->prev_in = substream;
 
+	if (uart->throttle_tx) return;
+
 	/* Check write status, if we get a TX fifo interrupt,
 	 * it's possible that there are still 2 bytes of data
 	 * in the FIFO */
@@ -252,6 +288,45 @@ static irqreturn_t snd_uart_pl011_interrupt(int irq, void *dev_id)
 	snd_uart_pl011_io_loop(uart);
 	spin_unlock(&uart->open_lock);
 	return IRQ_HANDLED;
+}
+
+#define TIMER_ATTEMPTS_LIMIT 255
+static void snd_uart_pl011_buffer_timer(unsigned long data)
+{
+        struct snd_uart_pl011 *uart;
+	static int attempts = TIMER_ATTEMPTS_LIMIT;
+
+        uart = (struct snd_uart_pl011 *)data;
+        spin_lock_irq(&uart->open_lock);
+        snd_uart_pl011_del_timer(uart);
+
+	if (attempts) attempts--;
+
+	if (readw(uart->membase + UART01x_FR) & UART01x_FR_BUSY) {
+		/* Still writing, reschedule */
+		snd_uart_pl011_add_timer(uart);
+		spin_unlock_irq(&uart->open_lock);
+		return;
+	}
+
+	uart->fifo_count = 0;
+
+	/* Check CTS - FIFO is empty */
+	if (readw(uart->membase + UART01x_FR) & UART01x_FR_CTS) {
+		while (uart->fifo_count < uart->fifo_limit /* Can we write ? */
+                	&& uart->buff_in_count > 0)     /* Do we want to? */
+                	snd_uart_pl011_buffer_output(uart);
+	
+		/* If the cable becomes disconnected, we may never get CTS.
+		 * Therefore limit the number of times we call the timer */
+		attempts = TIMER_ATTEMPTS_LIMIT;
+		if (unlikely(uart->draining)) wake_up(&uart->drain_wait);
+	}
+
+	if ((uart->buff_in_count) > 0 && attempts)
+		snd_uart_pl011_add_timer(uart);
+
+        spin_unlock_irq(&uart->open_lock);
 }
 
 static int snd_uart_pl011_detect(struct snd_uart_pl011 *uart)
@@ -295,7 +370,6 @@ static void snd_uart_pl011_do_open(struct snd_uart_pl011 * uart)
 	uart->buff_in_count = 0;
 	uart->buff_in = 0;
 	uart->buff_out = 0;
-	uart->fifo_limit = 16;
 	uart->fifo_count = 0;
 
 	writew(UART01x_CR_UARTEN	/* Enable UART */
@@ -322,7 +396,8 @@ static void snd_uart_pl011_do_open(struct snd_uart_pl011 * uart)
 	default:
 		writew(UART011_CR_RTS	/* Set Request-To-Send line active */
 		     | UART011_CR_RTSEN /* Hardware RTS */
-		     | UART011_CR_CTSEN /* Hardware CTS */
+			/* Hardware CTS unless throttling */
+		     | (uart->throttle_tx ? 0 : UART011_CR_CTSEN)
 		     | reg
 		     , uart->membase + UART011_CR);
 		break;
@@ -347,7 +422,8 @@ static void snd_uart_pl011_do_open(struct snd_uart_pl011 * uart)
 	} else if (uart->adaptor == SNDRV_SERIAL_GENERIC) {
 		writew(UART011_RXIM	/* Enable RX FIFO interrupt */
 		     | UART011_RTIM	/* Enable RX timeout interrupt */
-		     | UART011_TXIM	/* Enable TX FIFO interrupt */
+			/* Enable TX FIFO if not using throttling */
+		     | (uart->throttle_tx ? 0 : UART011_TXIM)
 		     , uart->membase + UART011_IMSC);
 	} else {
 		/* FIXME: Enable RX data and THRI */
@@ -466,6 +542,8 @@ static inline int snd_uart_pl011_write_buffer(struct snd_uart_pl011 *uart,
 		buff_in &= TX_BUFF_MASK;
 		uart->buff_in = buff_in;
 		uart->buff_in_count++;
+		if (uart->throttle_tx)
+			snd_uart_pl011_add_timer(uart);
 		return 1;
 	} else
 		return 0;
@@ -475,9 +553,10 @@ static int snd_uart_pl011_output_byte(struct snd_uart_pl011 *uart,
 				     struct snd_rawmidi_substream *substream,
 				     unsigned char midi_byte)
 {
-	if (uart->buff_in_count == 0) {
+	if ((uart->buff_in_count == 0) && (!uart->throttle_tx ||
+	    (readw(uart->membase + UART01x_FR) & UART01x_FR_CTS)))  {
 	        /* Tx Buffer Empty - try to write immediately */
-		if (readw(uart->membase + UART01x_FR) & UART011_FR_TXFE) {
+		if (!(readw(uart->membase + UART01x_FR) & UART01x_FR_BUSY)) {
 		        /* Transmitter FIFO empty */
 		        uart->fifo_count = 1;
 			writeb(midi_byte, uart->membase + UART01x_DR);
@@ -668,6 +747,9 @@ static int snd_uart_pl011_create(struct snd_card *card,
 				unsigned int speed,
 				int adaptor,
 				int droponfull,
+				int throttle_tx,
+				int throttle_delay,
+				int fifo_limit,
 				struct snd_uart_pl011 **ruart)
 {
 	static struct snd_device_ops ops = {
@@ -714,12 +796,19 @@ static int snd_uart_pl011_create(struct snd_card *card,
 	uart->membase = membase;
 	uart->mapbase = devptr->res.start;
 	uart->drop_on_full = droponfull;
+	uart->throttle_tx = throttle_tx;
+	uart->throttle_delay = throttle_delay;
+	uart->fifo_limit = fifo_limit;
 	uart->speed = speed;
 	uart->prev_out = -1;
 	uart->prev_in = 0;
 	uart->rstatus = 0;
 	memset(uart->prev_status, 0x80,
 			sizeof(unsigned char) * SNDRV_SERIAL_MAX_OUTS);
+	init_timer(&uart->buffer_timer);
+        uart->buffer_timer.function = snd_uart_pl011_buffer_timer;
+        uart->buffer_timer.data = (unsigned long)uart;
+        uart->timer_running = 0;
 
 	if (snd_uart_pl011_detect(uart) == 0) {
 		snd_printk(KERN_ERR "no UART detected\n");
@@ -860,6 +949,9 @@ static int snd_serial_probe(struct amba_device *devptr,
 					speed,
 					adaptor,
 					droponfull,
+					throttle_tx,
+					throttle_delay,
+					fifo_limit,
 					&uart)) < 0)
 		goto _err;
 
