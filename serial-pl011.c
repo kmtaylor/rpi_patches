@@ -72,6 +72,7 @@ static char *adaptor_names[] = {
 #define SNDRV_SERIAL_DROPBUFF   1 /* Non-blocking discard operation */
 #define SNDRV_SERIAL_NOTHROTTLE 0
 #define SNDRV_SERIAL_DEFAULT_FIFO 16
+#define TIMER_ATTEMPTS_LIMIT 255
 
 static int speed = 115200; /* 9600,19200,38400,57600,115200 */
 static int outs = 1;	 /* 1 to 16 */
@@ -79,7 +80,7 @@ static int ins = 1;	/* 1 to 16 */
 static int adaptor = SNDRV_SERIAL_GENERIC;
 static bool droponfull = SNDRV_SERIAL_NORMALBUFF;
 static bool throttle_tx = SNDRV_SERIAL_NOTHROTTLE;
-static int throttle_delay = 1;
+static int throttle_delay = 1000;
 static int fifo_limit = SNDRV_SERIAL_DEFAULT_FIFO;
 
 module_param(speed, int, 0444);
@@ -93,7 +94,7 @@ MODULE_PARM_DESC(droponfull, "Flag to enable drop-on-full buffer mode");
 module_param(throttle_tx, bool, 0444);
 MODULE_PARM_DESC(throttle_tx, "Do not continuously fill TX FIFO");
 module_param(throttle_delay, int, 0444);
-MODULE_PARM_DESC(throttle_delay, "Time in jiffies between each TX write");
+MODULE_PARM_DESC(throttle_delay, "Time in us between each TX write");
 module_param(fifo_limit, int, 0444);
 MODULE_PARM_DESC(fifo_limit, "Maximum TX bytes per write");
 
@@ -161,7 +162,7 @@ struct snd_uart_pl011 {
         int buff_out;
         int drop_on_full;
 	int throttle_tx;
-	int throttle_delay;
+	ktime_t throttle_delay;
 
 	int timer_running;
 	u16 control_reg;
@@ -170,27 +171,9 @@ struct snd_uart_pl011 {
 		TX_BLOCK_RX,
 		TX_BUSY,
 	} tx_state;
-	struct timer_list buffer_timer;
+	int tx_attempts;
+	struct hrtimer buffer_timer;
 };
-
-static inline void snd_uart_pl011_add_timer(struct snd_uart_pl011 *uart, 
-		unsigned long delay)
-{
-        if (!uart->timer_running) {
-                /* Smallest possible delay */
-                uart->buffer_timer.expires = jiffies + delay;
-                uart->timer_running = 1;
-                add_timer(&uart->buffer_timer);
-        }
-}
-
-static inline void snd_uart_pl011_del_timer(struct snd_uart_pl011 *uart)
-{
-        if (uart->timer_running) {
-                del_timer(&uart->buffer_timer);
-                uart->timer_running = 0;
-        }
-}
 
 static inline void snd_uart_pl011_stop_rx(struct snd_uart_pl011 *uart)
 {
@@ -200,6 +183,24 @@ static inline void snd_uart_pl011_stop_rx(struct snd_uart_pl011 *uart)
 static inline void snd_uart_pl011_start_rx(struct snd_uart_pl011 *uart)
 {
 	writew(uart->control_reg | UART011_CR_RTS, uart->membase + UART011_CR);
+}
+
+static inline void snd_uart_pl011_start_timer(struct snd_uart_pl011 *uart)
+{
+        if (!uart->timer_running) {
+		snd_uart_pl011_stop_rx(uart);
+		uart->tx_state = TX_BLOCK_RX;
+		uart->tx_attempts = TIMER_ATTEMPTS_LIMIT;
+		hrtimer_start(&uart->buffer_timer, uart->throttle_delay,
+				HRTIMER_MODE_REL);
+                uart->timer_running = 1;
+        }
+}
+
+static inline void snd_uart_pl011_del_timer(struct snd_uart_pl011 *uart)
+{
+        hrtimer_cancel(&uart->buffer_timer);
+        uart->timer_running = 0;
 }
 
 /* This macro is only used in snd_uart_pl011_io_loop */
@@ -307,22 +308,21 @@ static irqreturn_t snd_uart_pl011_interrupt(int irq, void *dev_id)
 	return IRQ_HANDLED;
 }
 
-#define TIMER_ATTEMPTS_LIMIT 255
-static void snd_uart_pl011_buffer_timer(unsigned long data)
+static enum hrtimer_restart snd_uart_pl011_buffer_timer(struct hrtimer *handle)
 {
-        struct snd_uart_pl011 *uart;
-	static int attempts;
+        struct snd_uart_pl011 *uart = 
+		container_of(handle, struct snd_uart_pl011, buffer_timer);
+	enum hrtimer_restart restart = HRTIMER_NORESTART;
+	int double_delay = 0;
 
-        uart = (struct snd_uart_pl011 *)data;
-        spin_lock_irq(&uart->open_lock);
-        snd_uart_pl011_del_timer(uart);
+        spin_lock(&uart->open_lock);
 
 	switch (uart->tx_state) {
 	    case TX_IDLE:
 		snd_uart_pl011_stop_rx(uart);
+		uart->tx_attempts = TIMER_ATTEMPTS_LIMIT;
 		uart->tx_state = TX_BLOCK_RX;
-		attempts = TIMER_ATTEMPTS_LIMIT;
-		snd_uart_pl011_add_timer(uart, uart->throttle_delay);
+		restart = HRTIMER_RESTART;
 		break;
 
 	    case TX_BLOCK_RX:
@@ -334,15 +334,14 @@ static void snd_uart_pl011_buffer_timer(unsigned long data)
 				snd_uart_pl011_buffer_output(uart); 
 		
 			uart->tx_state = TX_BUSY;
-			snd_uart_pl011_add_timer(uart, uart->throttle_delay);
+			restart = HRTIMER_RESTART;
 			if (unlikely(uart->draining))
 				wake_up(&uart->drain_wait);
 		} else {
 			/* If the cable becomes disconnected, we may never get 
 			 * CTS. Therefore limit the number of times we call the
 			 * timer */
-			if (attempts--) snd_uart_pl011_add_timer(uart,
-						    uart->throttle_delay);
+			if (uart->tx_attempts--) restart = HRTIMER_RESTART;
 			else uart->tx_state = TX_IDLE;
 		}
 
@@ -351,20 +350,31 @@ static void snd_uart_pl011_buffer_timer(unsigned long data)
 	    case TX_BUSY:
 		if (readw(uart->membase + UART01x_FR) & UART01x_FR_BUSY) {
 			/* Still writing, reschedule */
-			snd_uart_pl011_add_timer(uart, uart->throttle_delay);
+			restart = HRTIMER_RESTART;
 		} else {
 			/* Finished writing allow receive */
 			uart->fifo_count = 0;
 			uart->tx_state = TX_IDLE;
 			snd_uart_pl011_start_rx(uart);
-			if (uart->buff_in_count > 0)
-				snd_uart_pl011_add_timer(uart,
-						uart->throttle_delay);
+			if (uart->buff_in_count > 0) {
+				restart = HRTIMER_RESTART;
+				double_delay = 1;
+			}
 		}
 		break;
 	}
 
-        spin_unlock_irq(&uart->open_lock);
+	if (restart == HRTIMER_RESTART) {
+		uart->timer_running = 1;
+		hrtimer_forward_now(&uart->buffer_timer,
+			double_delay ? ktime_add(uart->throttle_delay, 
+				uart->throttle_delay) : uart->throttle_delay);
+	} else
+		uart->timer_running = 0;
+
+        spin_unlock(&uart->open_lock);
+
+	return restart;
 }
 
 static int snd_uart_pl011_detect(struct snd_uart_pl011 *uart)
@@ -584,7 +594,7 @@ static inline int snd_uart_pl011_write_buffer(struct snd_uart_pl011 *uart,
 		uart->buff_in = buff_in;
 		uart->buff_in_count++;
 		if (uart->throttle_tx)
-			snd_uart_pl011_add_timer(uart, 0);
+			snd_uart_pl011_start_timer(uart);
 		return 1;
 	} else
 		return 0;
@@ -714,8 +724,10 @@ static void snd_uart_pl011_output_trigger(struct snd_rawmidi_substream *substrea
 	if (up) {
 		uart->filemode |= SERIAL_MODE_OUTPUT_TRIGGERED;
 		snd_uart_pl011_output_write(substream);
-	} else
+	} else {
 		uart->filemode &= ~SERIAL_MODE_OUTPUT_TRIGGERED;
+		snd_uart_pl011_del_timer(uart);
+	}
 	spin_unlock_irqrestore(&uart->open_lock, flags);
 }
 
@@ -836,15 +848,14 @@ static int snd_uart_pl011_create(struct snd_card *card,
 	uart->mapbase = devptr->res.start;
 	uart->drop_on_full = droponfull;
 	uart->throttle_tx = throttle_tx;
-	uart->throttle_delay = throttle_delay;
+	uart->throttle_delay = ns_to_ktime(throttle_delay * 1000);
 	uart->fifo_limit = fifo_limit;
 	uart->speed = speed;
 	uart->prev_out = -1;
 	memset(uart->prev_status, 0x80,
 			sizeof(unsigned char) * SNDRV_SERIAL_MAX_OUTS);
-	init_timer(&uart->buffer_timer);
+	hrtimer_init(&uart->buffer_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
         uart->buffer_timer.function = snd_uart_pl011_buffer_timer;
-        uart->buffer_timer.data = (unsigned long)uart;
 
 	if (snd_uart_pl011_detect(uart) == 0) {
 		snd_printk(KERN_ERR "no UART detected\n");
