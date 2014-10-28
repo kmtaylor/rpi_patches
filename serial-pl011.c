@@ -71,6 +71,7 @@ static char *adaptor_names[] = {
 #define SNDRV_SERIAL_NORMALBUFF 0 /* Normal blocking buffer operation */
 #define SNDRV_SERIAL_DROPBUFF   1 /* Non-blocking discard operation */
 #define SNDRV_SERIAL_NOTHROTTLE 0
+#define SNDRV_SERIAL_NORTSCTS 0
 #define SNDRV_SERIAL_DEFAULT_FIFO 16
 #define TIMER_ATTEMPTS_LIMIT 255
 
@@ -82,6 +83,7 @@ static bool droponfull = SNDRV_SERIAL_NORMALBUFF;
 static bool throttle_tx = SNDRV_SERIAL_NOTHROTTLE;
 static int throttle_delay = 1000;
 static int fifo_limit = SNDRV_SERIAL_DEFAULT_FIFO;
+static bool flow_control = SNDRV_SERIAL_NORTSCTS;
 
 module_param(speed, int, 0444);
 MODULE_PARM_DESC(speed, "Speed in bauds.");
@@ -95,6 +97,8 @@ module_param(throttle_tx, bool, 0444);
 MODULE_PARM_DESC(throttle_tx, "Do not continuously fill TX FIFO");
 module_param(throttle_delay, int, 0444);
 MODULE_PARM_DESC(throttle_delay, "Time in us between each TX write");
+module_param(flow_control, bool, 0444);
+MODULE_PARM_DESC(flow_control, "Use RTS/CTS flow control");
 module_param(fifo_limit, int, 0444);
 MODULE_PARM_DESC(fifo_limit, "Maximum TX bytes per write");
 
@@ -162,6 +166,7 @@ struct snd_uart_pl011 {
         int buff_out;
         int drop_on_full;
 	int throttle_tx;
+	int flow_control;
 	ktime_t throttle_delay;
 
 	int timer_running;
@@ -185,24 +190,6 @@ static inline void snd_uart_pl011_start_rx(struct snd_uart_pl011 *uart)
 	writew(uart->control_reg | UART011_CR_RTS, uart->membase + UART011_CR);
 }
 
-static inline void snd_uart_pl011_start_timer(struct snd_uart_pl011 *uart)
-{
-        if (!uart->timer_running) {
-		snd_uart_pl011_stop_rx(uart);
-		uart->tx_state = TX_BLOCK_RX;
-		uart->tx_attempts = TIMER_ATTEMPTS_LIMIT;
-		hrtimer_start(&uart->buffer_timer, uart->throttle_delay,
-				HRTIMER_MODE_REL);
-                uart->timer_running = 1;
-        }
-}
-
-static inline void snd_uart_pl011_del_timer(struct snd_uart_pl011 *uart)
-{
-        hrtimer_cancel(&uart->buffer_timer);
-        uart->timer_running = 0;
-}
-
 /* This macro is only used in snd_uart_pl011_io_loop */
 static inline void snd_uart_pl011_buffer_output(struct snd_uart_pl011 *uart)
 {
@@ -215,6 +202,45 @@ static inline void snd_uart_pl011_buffer_output(struct snd_uart_pl011 *uart)
 		uart->buff_out = buff_out;
 		uart->buff_in_count--;
 	}
+}
+
+static inline int snd_uart_pl011_write_fifo_timer(struct snd_uart_pl011 * uart)
+{
+	/* Check CTS - FIFO is empty */
+	if (!uart->flow_control ||
+			readw(uart->membase + UART01x_FR) & UART01x_FR_CTS) {
+		while (uart->fifo_count < uart->fifo_limit
+			&& uart->buff_in_count > 0)
+			snd_uart_pl011_buffer_output(uart); 
+	
+		uart->tx_state = TX_BUSY;
+		if (unlikely(uart->draining))
+			wake_up(&uart->drain_wait);
+		return 1;
+	}
+	return 0;
+}
+
+static inline void snd_uart_pl011_start_timer(struct snd_uart_pl011 *uart)
+{
+        if (!uart->timer_running) {
+		if (uart->flow_control) {
+			snd_uart_pl011_stop_rx(uart);
+			uart->tx_state = TX_BLOCK_RX;
+			uart->tx_attempts = TIMER_ATTEMPTS_LIMIT;
+		} else {
+			snd_uart_pl011_write_fifo_timer(uart);
+		}
+		hrtimer_start(&uart->buffer_timer, uart->throttle_delay,
+				HRTIMER_MODE_REL);
+		uart->timer_running = 1;
+        }
+}
+
+static inline void snd_uart_pl011_del_timer(struct snd_uart_pl011 *uart)
+{
+        hrtimer_cancel(&uart->buffer_timer);
+        uart->timer_running = 0;
 }
 
 /* This loop should be called with interrupts disabled
@@ -327,16 +353,8 @@ static enum hrtimer_restart snd_uart_pl011_buffer_timer(struct hrtimer *handle)
 
 	    case TX_BLOCK_RX:
 		/* Write FIFO, reschedule if necessary */
-		/* Check CTS - FIFO is empty */
-		if (readw(uart->membase + UART01x_FR) & UART01x_FR_CTS) {
-			while (uart->fifo_count < uart->fifo_limit
-				&& uart->buff_in_count > 0)
-				snd_uart_pl011_buffer_output(uart); 
-		
-			uart->tx_state = TX_BUSY;
+		if (snd_uart_pl011_write_fifo_timer(uart)) {
 			restart = HRTIMER_RESTART;
-			if (unlikely(uart->draining))
-				wake_up(&uart->drain_wait);
 		} else {
 			/* If the cable becomes disconnected, we may never get 
 			 * CTS. Therefore limit the number of times we call the
@@ -354,18 +372,21 @@ static enum hrtimer_restart snd_uart_pl011_buffer_timer(struct hrtimer *handle)
 		} else {
 			/* Finished writing allow receive */
 			uart->fifo_count = 0;
-			uart->tx_state = TX_IDLE;
-			snd_uart_pl011_start_rx(uart);
+			if (uart->flow_control) {
+				double_delay = 1;
+				uart->tx_state = TX_IDLE;
+				snd_uart_pl011_start_rx(uart);
+			} else {
+				uart->tx_state = TX_BLOCK_RX;
+			}
 			if (uart->buff_in_count > 0) {
 				restart = HRTIMER_RESTART;
-				double_delay = 1;
 			}
 		}
 		break;
 	}
 
 	if (restart == HRTIMER_RESTART) {
-		uart->timer_running = 1;
 		hrtimer_forward_now(&uart->buffer_timer,
 			double_delay ? ktime_add(uart->throttle_delay, 
 				uart->throttle_delay) : uart->throttle_delay);
@@ -800,6 +821,7 @@ static int snd_uart_pl011_create(struct snd_card *card,
 				int droponfull,
 				int throttle_tx,
 				int throttle_delay,
+				int flow_control,
 				int fifo_limit,
 				struct snd_uart_pl011 **ruart)
 {
@@ -849,6 +871,7 @@ static int snd_uart_pl011_create(struct snd_card *card,
 	uart->drop_on_full = droponfull;
 	uart->throttle_tx = throttle_tx;
 	uart->throttle_delay = ns_to_ktime(throttle_delay * 1000);
+	uart->flow_control = flow_control;
 	uart->fifo_limit = fifo_limit;
 	uart->speed = speed;
 	uart->prev_out = -1;
@@ -998,6 +1021,7 @@ static int snd_serial_probe(struct amba_device *devptr,
 					droponfull,
 					throttle_tx,
 					throttle_delay,
+					flow_control,
 					fifo_limit,
 					&uart)) < 0)
 		goto _err;
