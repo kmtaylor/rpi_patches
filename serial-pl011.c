@@ -82,6 +82,7 @@ static int adaptor = SNDRV_SERIAL_GENERIC;
 static bool droponfull = SNDRV_SERIAL_NORMALBUFF;
 static bool throttle_tx = SNDRV_SERIAL_NOTHROTTLE;
 static int throttle_delay = 1000;
+static int dynamic_throttle = 0;
 static int fifo_limit = SNDRV_SERIAL_DEFAULT_FIFO;
 static bool flow_control = SNDRV_SERIAL_NORTSCTS;
 
@@ -97,6 +98,8 @@ module_param(throttle_tx, bool, 0444);
 MODULE_PARM_DESC(throttle_tx, "Do not continuously fill TX FIFO");
 module_param(throttle_delay, int, 0444);
 MODULE_PARM_DESC(throttle_delay, "Time in us between each TX write");
+module_param(dynamic_throttle, int, 0444);
+MODULE_PARM_DESC(dynamic_throttle, "Dynamic delay between writes (percentage)");
 module_param(flow_control, bool, 0444);
 MODULE_PARM_DESC(flow_control, "Use RTS/CTS flow control");
 module_param(fifo_limit, int, 0444);
@@ -166,6 +169,7 @@ struct snd_uart_pl011 {
         int buff_out;
         int drop_on_full;
 	int throttle_tx;
+	int dynamic_throttle;
 	int flow_control;
 	ktime_t throttle_delay;
 
@@ -178,6 +182,7 @@ struct snd_uart_pl011 {
 	} tx_state;
 	int tx_attempts;
 	struct hrtimer buffer_timer;
+	unsigned char bytes_pending[SNDRV_SERIAL_MAX_OUTS];
 };
 
 static inline void snd_uart_pl011_stop_rx(struct snd_uart_pl011 *uart)
@@ -190,18 +195,67 @@ static inline void snd_uart_pl011_start_rx(struct snd_uart_pl011 *uart)
 	writew(uart->control_reg | UART011_CR_RTS, uart->membase + UART011_CR);
 }
 
+static inline void snd_uart_pl011_reset_delay_times(struct snd_uart_pl011 *uart)
+{
+	if (uart->dynamic_throttle == 0) return;
+
+	memset(uart->bytes_pending, 0, 
+			sizeof(unsigned char) * SNDRV_SERIAL_MAX_OUTS);
+}
+
+static inline void snd_uart_pl011_update_delay_time(struct snd_uart_pl011 *uart)
+{
+	enum {	CUR_OUTPUT_INIT = -2,
+		CUR_OUTPUT_CHANGE = -1,
+		CUR_OUTPUT_VALID = 0
+	};
+	static int current_output = CUR_OUTPUT_INIT;
+
+	if (uart->dynamic_throttle == 0) return;
+
+	if (uart->tx_buff[uart->buff_out] == 0xf5) {
+		current_output = CUR_OUTPUT_CHANGE;
+		return;
+	}
+
+	if (current_output == CUR_OUTPUT_CHANGE) {
+		current_output = uart->tx_buff[uart->buff_out] - 1;
+	}
+
+	if (current_output >= CUR_OUTPUT_VALID) {
+		uart->bytes_pending[current_output]++;
+	}
+}
+
+static inline void snd_uart_pl011_update_write_delay(
+		struct snd_uart_pl011 *uart)
+{
+	/* Delay based on MIDI baud rate of 31250 and maximum number of bytes
+	 * to send for any channel. A MIDI byte is 10 bits, so the delay time
+	 * per byte is (10/31250) = 320 us */
+	unsigned char i, max_bytes;
+
+	if (uart->dynamic_throttle == 0) return;
+
+	max_bytes = 0;
+	for (i = 0; i < SNDRV_SERIAL_MAX_OUTS; i++) {
+		if (uart->bytes_pending[i] > max_bytes)
+			max_bytes = uart->bytes_pending[i];
+	}
+	uart->throttle_delay = ns_to_ktime(uart->dynamic_throttle * 
+			(max_bytes * 320 * (1000/100)));
+}
+
 /* This macro is only used in snd_uart_pl011_io_loop */
 static inline void snd_uart_pl011_buffer_output(struct snd_uart_pl011 *uart)
 {
 	unsigned short buff_out = uart->buff_out;
-	if (uart->buff_in_count > 0) {
-		writeb(uart->tx_buff[buff_out], uart->membase + UART01x_DR);
-		uart->fifo_count++;
-		buff_out++;
-		buff_out &= TX_BUFF_MASK;
-		uart->buff_out = buff_out;
-		uart->buff_in_count--;
-	}
+	writeb(uart->tx_buff[buff_out], uart->membase + UART01x_DR);
+	uart->fifo_count++;
+	buff_out++;
+	buff_out &= TX_BUFF_MASK;
+	uart->buff_out = buff_out;
+	uart->buff_in_count--;
 }
 
 static inline int snd_uart_pl011_write_fifo_timer(struct snd_uart_pl011 * uart)
@@ -209,9 +263,13 @@ static inline int snd_uart_pl011_write_fifo_timer(struct snd_uart_pl011 * uart)
 	/* Check CTS - FIFO is empty */
 	if (!uart->flow_control ||
 			readw(uart->membase + UART01x_FR) & UART01x_FR_CTS) {
+		snd_uart_pl011_reset_delay_times(uart);
 		while (uart->fifo_count < uart->fifo_limit
-			&& uart->buff_in_count > 0)
-			snd_uart_pl011_buffer_output(uart); 
+			&& uart->buff_in_count > 0) {
+			snd_uart_pl011_buffer_output(uart);
+			snd_uart_pl011_update_delay_time(uart);
+		}
+		snd_uart_pl011_update_write_delay(uart);
 	
 		uart->tx_state = TX_BUSY;
 		if (unlikely(uart->draining))
@@ -821,6 +879,7 @@ static int snd_uart_pl011_create(struct snd_card *card,
 				int droponfull,
 				int throttle_tx,
 				int throttle_delay,
+				int dynamic_throttle,
 				int flow_control,
 				int fifo_limit,
 				struct snd_uart_pl011 **ruart)
@@ -871,6 +930,7 @@ static int snd_uart_pl011_create(struct snd_card *card,
 	uart->drop_on_full = droponfull;
 	uart->throttle_tx = throttle_tx;
 	uart->throttle_delay = ns_to_ktime(throttle_delay * 1000);
+	uart->dynamic_throttle = dynamic_throttle;
 	uart->flow_control = flow_control;
 	uart->fifo_limit = fifo_limit;
 	uart->speed = speed;
@@ -1021,6 +1081,7 @@ static int snd_serial_probe(struct amba_device *devptr,
 					droponfull,
 					throttle_tx,
 					throttle_delay,
+					dynamic_throttle,
 					flow_control,
 					fifo_limit,
 					&uart)) < 0)
