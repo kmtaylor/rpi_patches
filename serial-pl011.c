@@ -1068,7 +1068,8 @@ static int snd_serial_probe(struct amba_device *devptr,
 		return -ENODEV;
 	}
 
-	err  = snd_card_create(-1, NULL, THIS_MODULE, 0, &card);
+	err  = snd_card_new(&devptr->dev, index[dev], id[dev], THIS_MODULE,
+			    0, &card);
 	if (err < 0)
 		return err;
 
