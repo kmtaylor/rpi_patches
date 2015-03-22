@@ -1,6 +1,6 @@
 diff -ur jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/common/jack/systemdeps.h jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/common/jack/systemdeps.h
---- jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/common/jack/systemdeps.h	2012-05-29 19:11:00.000000000 +0000
-+++ jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/common/jack/systemdeps.h	2014-07-16 00:27:07.393066708 +0000
+--- jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/common/jack/systemdeps.h	2012-05-30 05:11:00.000000000 +1000
++++ jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/common/jack/systemdeps.h	2014-07-16 10:27:07.393066708 +1000
 @@ -120,4 +120,9 @@
  
      #endif /* __APPLE__ || __linux__ || __sun__ || sun */
@@ -11,9 +11,33 @@ diff -ur jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/common/jack/systemdep
 +#endif
 +
  #endif
+diff -ur jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/common/JackMidiPort.cpp jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/common/JackMidiPort.cpp
+--- jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/common/JackMidiPort.cpp	2012-05-30 05:11:00.000000000 +1000
++++ jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/common/JackMidiPort.cpp	2015-02-04 11:41:45.810000000 +1100
+@@ -124,7 +124,7 @@
+                 next_buf = buf;
+             }
+         }
+-        assert(next_event != 0);
++	if (!next_event) break;
+ 
+         // write the event
+         jack_midi_data_t* dest = mix->ReserveEvent(next_event->time, next_event->size);
+diff -ur jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/common/JackTimedDriver.cpp jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/common/JackTimedDriver.cpp
+--- jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/common/JackTimedDriver.cpp	2012-05-30 05:11:00.000000000 +1000
++++ jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/common/JackTimedDriver.cpp	2014-08-10 02:28:55.930000000 +1000
+@@ -61,7 +61,7 @@
+         NotifyXRun(cur_time_usec, float(cur_time_usec - fBeginDateUst));
+         fCycleCount = 0;
+         wait_time_usec = 0;
+-        jack_error("JackTimedDriver::Process XRun = %ld usec", (cur_time_usec - fBeginDateUst));
++        jack_error("JackTimedDriver::Process XRun = %lld usec, %lld, %lld", (cur_time_usec - fBeginDateUst), cur_time_usec, fBeginDateUst);
+     }
+ 
+     //jack_log("JackTimedDriver::Process wait_time = %d", wait_time_usec);
 diff -ur jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/debian/rules jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/debian/rules
---- jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/debian/rules	2012-11-27 20:22:31.000000000 +0000
-+++ jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/debian/rules	2014-07-15 23:44:29.514352549 +0000
+--- jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/debian/rules	2012-11-28 07:22:31.000000000 +1100
++++ jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/debian/rules	2014-07-16 09:44:29.514352549 +1000
 @@ -41,7 +41,7 @@
  
  waf-configure-options = --prefix=/usr --classic
@@ -32,8 +56,8 @@ diff -ur jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/debian/rules jack/jac
  
  binary-install/jackd2::
 diff -ur jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/alsa_driver.c jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/alsa_driver.c
---- jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/alsa_driver.c	2012-05-29 19:11:00.000000000 +0000
-+++ jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/alsa_driver.c	2014-07-23 11:35:48.970000000 +0000
+--- jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/alsa_driver.c	2012-05-30 05:11:00.000000000 +1000
++++ jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/alsa_driver.c	2014-07-23 21:35:48.970000000 +1000
 @@ -991,8 +991,9 @@
  		}
  	}
@@ -81,8 +105,8 @@ diff -ur jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/alsa_drive
  	contiguous = 0;
  	orig_nframes = nframes;
 diff -ur jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/alsa_seqmidi.c jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/alsa_seqmidi.c
---- jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/alsa_seqmidi.c	2012-05-29 19:11:00.000000000 +0000
-+++ jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/alsa_seqmidi.c	2014-07-17 01:56:57.363334526 +0000
+--- jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/alsa_seqmidi.c	2012-05-30 05:11:00.000000000 +1000
++++ jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/alsa_seqmidi.c	2014-07-17 11:56:57.363334526 +1000
 @@ -145,13 +145,13 @@
  	{
  		SND_SEQ_PORT_CAP_SUBS_READ,
@@ -122,8 +146,8 @@ diff -ur jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/alsa_seqmi
  	if (type == PORT_INPUT)
  		err = alsa_connect_from(self, port->remote.client, port->remote.port);
 diff -ur jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/JackAlsaDriver.cpp jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/JackAlsaDriver.cpp
---- jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/JackAlsaDriver.cpp	2012-05-29 19:11:00.000000000 +0000
-+++ jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/JackAlsaDriver.cpp	2014-07-29 01:44:28.660000000 +0000
+--- jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/JackAlsaDriver.cpp	2012-05-30 05:11:00.000000000 +1000
++++ jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/JackAlsaDriver.cpp	2014-07-29 11:44:28.660000000 +1000
 @@ -350,7 +350,7 @@
  
  int JackAlsaDriver::Start()
@@ -169,8 +193,8 @@ diff -ur jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/JackAlsaDr
      Jack::JackDriverClientInterface* threaded_driver = new Jack::JackThreadedDriver(g_alsa_driver);
      // Special open for ALSA driver...
 diff -ur jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/JackAlsaDriver.h jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/JackAlsaDriver.h
---- jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/JackAlsaDriver.h	2012-05-29 19:11:00.000000000 +0000
-+++ jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/JackAlsaDriver.h	2014-07-20 05:26:17.950000000 +0000
+--- jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/JackAlsaDriver.h	2012-05-30 05:11:00.000000000 +1000
++++ jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/JackAlsaDriver.h	2014-07-20 15:26:17.950000000 +1000
 @@ -22,6 +22,7 @@
  #define __JackAlsaDriver__
  
@@ -198,8 +222,8 @@ diff -ur jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/alsa/JackAlsaDr
          virtual ~JackAlsaDriver()
          {}
 diff -ur jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/JackLinuxTime.c jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/JackLinuxTime.c
---- jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/JackLinuxTime.c	2012-05-29 19:11:00.000000000 +0000
-+++ jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/JackLinuxTime.c	2014-07-16 01:30:47.627009873 +0000
+--- jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/JackLinuxTime.c	2012-05-30 05:11:00.000000000 +1000
++++ jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/JackLinuxTime.c	2014-08-10 02:28:19.160000000 +1000
 @@ -217,7 +217,7 @@
  
  SERVER_EXPORT void InitTime()
@@ -210,8 +234,8 @@ diff -ur jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/linux/JackLinuxTime.c
  
  SERVER_EXPORT void EndTime()
 diff -ur jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/posix/JackCompilerDeps_os.h jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/posix/JackCompilerDeps_os.h
---- jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/posix/JackCompilerDeps_os.h	2012-05-29 19:11:00.000000000 +0000
-+++ jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/posix/JackCompilerDeps_os.h	2014-07-16 00:28:29.610136977 +0000
+--- jack-orig/jackd2-1.9.8~dfsg.4+20120529git007cdc37/posix/JackCompilerDeps_os.h	2012-05-30 05:11:00.000000000 +1000
++++ jack/jackd2-1.9.8~dfsg.4+20120529git007cdc37/posix/JackCompilerDeps_os.h	2014-07-16 10:28:29.610136977 +1000
 @@ -58,5 +58,10 @@
      #define POST_PACKED_STRUCTURE
  #endif
