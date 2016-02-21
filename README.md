@@ -1,6 +1,8 @@
 # dm9601-bug.patch
 Instruction how to patch and build the kernel:
 
+Note: if the cloning step below cause a Kernel Panic, you can swap the sd card to a Pi with a good Ethernet connection and perform the steps on that one.
+
 ```
 sudo rpi-update
 sudo apt-get -y update
@@ -14,7 +16,7 @@ make mrproper
 sudo modprobe configs
 zcat /proc/config.gz > .config
 make oldconfig
-make
+make # This may take about 12 hours.
 sudo make modules_install
 sudo cp arch/arm/boot/zImage /boot/kernel.img
 ```
